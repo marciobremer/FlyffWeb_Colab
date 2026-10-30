@@ -1,3 +1,4 @@
+import { FILTER, cleanPetFilter, emptyPetFilter, type PetFilter } from '../../shared/petfilter';
 import type { IncomingMessage, Server } from 'node:http';
 import { TICKS_PER_SEC } from '../../shared/math';
 import type { Duplex } from 'node:stream';
@@ -10,7 +11,7 @@ import { gmAuthority, runGmCommand } from './gm';
 import { rankOf, type Rank } from '../../shared/rank';
 import { RIDE_TAG } from '../../shared/look';
 import { TRADE_SLOTS, type TradeOffer } from '../character/inventory';
-import { ItemCatalog } from '../common/items';
+import { ItemCatalog, jobCanUse } from '../common/items';
 import type { CombatRules, Equipped, Fighter } from './combat';
 import { MOB_ATTACK_RANGE, type Mob } from './mobs';
 import { GROUND_MS, OWNER_MS, type DropRules } from './drops';
@@ -21,7 +22,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { decodeText } from '../../shared/formats/rgn';
 import { rates } from '../common/rates';
-import { parseTeleports } from '../../shared/formats/teleport';
+import { parseAegonTeleports, parseTeleports } from '../../shared/formats/teleport';
 import { PartyManager, PARTY_MAX, PARTY_SKILLS, partyExpShares, type Party } from './party';
 import type { MoverProp } from './world';
 import { UpgradeRules, type SmithResult } from './upgrade';
@@ -52,7 +53,8 @@ import type { InvEdit } from '../character/inventory';
  *   { t: 'pierce', card, target }                   piercing: espeta a carta do espaço `card` da bolsa na suit do espaço `target` (também
  *                                                   da bolsa, não equipada) — resposta { t: 'pierced', ok, s } e o inventário novo
  *   { t: 'npcMenu', key } / { t: 'npcBuff', key }     perto do NPC: o que ele oferece (loja, buffs) / receber os buffs (Buff Pang)
- *   { t: 'zckTeleport', k }                         teleporte da janela Teleporter (tecla V): destino `k` do ZckTeleporteur.inc
+ *   { t: 'teleports' } → { t: 'teleports', list }   destinos da janela Teleporter (tecla V): nome, imagem, descrição, drops
+ *   { t: 'zckTeleport', k }                         teleporte da janela Teleporter: destino `k` da lista
  *   { t: 'buffOff', id }                            tira o buff da skill `id` (botão direito no ícone)
  *   { t: 'hide', m }                                partes escondidas do visual (bits de shared/look.ts HIDEABLE; também vai no 'join')
  *   { t: 'friendAdd', id } / { t: 'friendAnswer', id, ok } / { t: 'friendDel', id }   Mensageiro (tecla E): pedir amizade a
@@ -74,19 +76,23 @@ import type { InvEdit } from '../character/inventory';
  * (servidor → cliente):
  *   { t: 'welcome', id, players: PlayerView[] }     seu id + quem já está no mundo
  *   { t: 'ping', c } → { t: 'pong', c }          ping do rodapé (o cliente mede a ida e volta)
+ *   { t: 'pet', a, m }                               pet coletor do jogador `a` apareceu (m = MI_*) ou sumiu (m = 0)
+ *   { t: 'petGo', a, x, z, ms }                      o pet de `a` vai buscar o item em (x, z) e chega em `ms`
+ *   { t: 'petFilter', f, n } ↔                       filtro do pet (o cliente manda para gravar; o servidor manda ao entrar, n = nome e ícone dos itens das listas)
+ *   { t: 'petFind', q } → { t: 'petFind', list }     busca de itens para as listas do filtro: [id, nome, ícone]
  *   { t: 'clock', now, fixed }                       relógio do servidor (dia e noite) e a hora fixada pelo GM (null = andando)
  *   { t: 'friends', list: FriendView[] } / { t: 'friendOn', id, on } / { t: 'friendReq', id, name }
  *   { t: 'friendNew', f: FriendView } / { t: 'friendDel', id }   lista de amigos (ao entrar), amigo entrou/saiu, pedido
  *                                                   recebido, amizade feita, desfeita
  *   { t: 'party', p: PartyView | null } / { t: 'partyReq', id, name } / { t: 'partyList', list }   sua party (ao mudar e
  *                                                   a cada 1,5 s, com o HP dos membros), convite recebido, lista de partys
- *   { t: 'guildView', g } / { t: 'guildReq', id, name, guild } / { t: 'guildTag', id, g }   sua guild (membros, cargos),
+ *   { t: 'guildView', g } / { t: 'guildReq', id, name, guild } / { t: 'guildTag', id, g, m? }   sua guild (membros, cargos),
  *                                                   convite recebido, nome da guild de alguém mudou (acima do nome)
  *   { t: 'pm', with, wname, from, name, text }      mensagem privada (com quem é a conversa e o nome dele, quem escreveu)
  *   { t: 'tradeReq', id, name } / { t: 'trade', name, me, them, lock: [eu, ele], ok: [eu, ele] } / { t: 'tradeClose', text }
  *                                                   trade: pedido recebido, janela (ofertas: { gold, items: [{ s, it, d }] }), fechou
  *   { t: 'enter', player: PlayerView }              alguém entrou
- *   { t: 'invis', id, on }                          GM ficou invisível / visível (Dark Illusion; só GMs/admins e ele mesmo recebem)
+ *   { t: 'invis', id, on }                          ficou invisível / visível (modo invisível de GM ou Dark Illusion; só GMs/admins e ele mesmo recebem)
  *   { t: 'god', on }                                seu modo imortal de GM/admin (//god; ligado ao entrar)
  *   { t: 'leave', id }                              alguém saiu
  *   { t: 'states', list: [id, x, y, z, h, s][] }    atualizações agrupadas, 10 por segundo, só de quem mudou
@@ -115,7 +121,7 @@ import type { InvEdit } from '../character/inventory';
  *                                                   s stand/walk/run/dead; hp em milésimos do máximo
  * O servidor confere a sessão e o dono do personagem, descarta valores absurdos e salva a posição ao sair.
  */
-export interface PlayerView { /** mundo onde está (WdMadrigal, WdKebaras…) */ w: string; /** nome da guild (aparece acima do nome) */ guild?: string; id: number; name: string; sex: number; hair: number; head: number; /** cor do cabelo (m_dwHairColor; 0 = padrão) */ hc?: number; level: number; p: [number, number, number]; h: number; s: string; /** símbolos II_* equipados */ eq: string[]; /** postura de combate 1–15 (0 = sem arma) */ mt: number; /** classe (JOB_*) */ job: number; /** conta de admin ou GM (cor do nome) */ rank?: Rank; /** GM invisível (Dark Illusion) — só GMs/admins recebem */ iv?: 1 }
+export interface PlayerView { /** mundo onde está (WdMadrigal, WdKebaras…) */ w: string; /** nome da guild (aparece acima do nome) */ guild?: string; id: number; name: string; sex: number; hair: number; head: number; /** cor do cabelo (m_dwHairColor; 0 = padrão) */ hc?: number; /** pet coletor (MI_*) seguindo o personagem */ pet?: number; /** mestre da guild (nome da guild dourado) */ gmaster?: 1; level: number; p: [number, number, number]; h: number; s: string; /** símbolos II_* equipados */ eq: string[]; /** postura de combate 1–15 (0 = sem arma) */ mt: number; /** classe (JOB_*) */ job: number; /** conta de admin ou GM (cor do nome) */ rank?: Rank; /** GM invisível (Dark Illusion) — só GMs/admins recebem */ iv?: 1 }
 
 /** trade entre dois jogadores: o que cada um pôs, quem deu OK (trava a oferta) e quem confirmou a troca */
 interface Trade { a: Conn; b: Conn; offer: Map<Conn, TradeOffer>; lock: Set<Conn>; ok: Set<Conn>; busy: boolean }
@@ -123,8 +129,13 @@ interface Conn { ws: WebSocket; player: PlayerView | null; accountId: number; di
   /** combate: atributos, HP/MP/FP, exp, morte, ritmo dos golpes */ cb: PlayerCombat | null;
   /** itens do chão que este cliente conhece */ ground: Set<number>;
   /** partes do visual escondidas pelo jogador (máscara de bits, shared/look.ts) */ hide: number;
-  /** GM invisível (Dark Illusion do painel): jogadores comuns não o veem e os mobs o ignoram */ invis?: boolean;
+  /** invisível agora (modo invisível de GM ou Dark Illusion): jogadores comuns não o veem e os mobs o ignoram */ invis?: boolean;
+  /** modo invisível do painel de GM (//invis) */ gmInvis?: boolean;
+  /** Dark Illusion (SI_ACR_SUP_DARKILLUSION) até este instante (ms); 0/undefined = sem */ dark?: number;
   /** GM/admin imortal (//god, ligado ao entrar): os golpes chegam e o dano aparece, mas o HP não cai */ god?: boolean;
+  /** pet coletor ativo (item IK3_PET): item, MI_* que aparece, ocupado buscando um item até `busy` (ms) e itens que não couberam */
+  pet?: { item: number; mover: number; busy: number; skip: Set<number> };
+  /** filtro do pet (janela Pet Filter, tecla U) */ petFilter?: PetFilter;
   /** modo de batalha desligado (MOT_BASE_BATTLE): postura normal mesmo com arma; atacar liga de novo */ peace?: boolean; /** postura da arma equipada */ weaponMt?: number;
   /** ids dos amigos (Mensageiro) e pedidos de amizade recebidos (id de quem pediu → quando) */ friends?: Set<number>; friendReqs?: Map<number, number>;
   /** convites de party recebidos (id de quem convidou → quando) */ partyReqs?: Map<number, number>;
@@ -203,11 +214,29 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     } catch { /* sem a tabela */ }
     return m;
   })();
-  /** destinos do teleporte (ZckTeleporteur.inc) — mesmo leitor do cliente, então o índice bate */
-  const teleports = (() => {
+  /**
+   * Destinos do teleporte (janela Teleporter, tecla V): o AegonTeleporter.inc do Titanium (imagem, descrição com o nível
+   * aconselhado e o que dropa); sem ele, o ZckTeleporteur.inc. O cliente pede a lista pronta ('teleports') e manda o índice.
+   */
+  interface Teleport { name: string; header: string; image: string; type: 'city' | 'collect' | 'dungeon' | 'zone'; desc: string; world: string; pos: [number, number, number]; items: string[] }
+  const teleports: Teleport[] = (() => {
     if (!inventory) return [];
-    try { const b = fs.readFileSync(path.join(inventory.catalog.resDir, 'ZckTeleporteur.inc')); return parseTeleports(decodeText(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer, 'windows-1252')); } catch { return []; }
+    const dir = inventory.catalog.resDir;
+    const read = (f: string, enc = 'windows-1252') => { const b = fs.readFileSync(path.join(dir, f)); return decodeText(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer, enc); };
+    try {
+      const list = parseAegonTeleports(read('AegonTeleporter.inc'));
+      // TID_TELEPORTER_DESC_n → IDS_TEXTCLIENT_INC_… (textClient.inc) → texto (textClient.txt.txt; "\n" vira quebra de linha)
+      let tids = new Map<string, string>(), ids = new Map<string, string>();
+      // o texto vem separado da chave por tab ou espaços
+      try { tids = new Map([...read('textClient.inc').matchAll(/^\s*(TID_\w+)\s+\S+\s*\{\s*(IDS_\w+)\s*\}/gm)].map((m) => [m[1], m[2]])); ids = new Map([...read('textClient.txt.txt').matchAll(/^(IDS_\w+)[ 	]+(.+?)\s*$/gm)].map((m) => [m[1], m[2]])); } catch { /* sem textos */ }
+      const text = (tid: string) => (ids.get(tids.get(tid) ?? '') ?? '').replace(/\\n/g, '\n').trim();
+      if (list.length) return list.map((t) => ({ name: t.name, header: t.header || t.name, image: t.image ? `Teleporter/${t.image}` : '', type: t.type === 1 ? 'collect' as const : t.type === 2 ? 'dungeon' as const : 'city' as const, desc: text(t.desc), world: t.world, pos: t.pos, items: t.items }));
+    } catch { /* sem o AegonTeleporter.inc */ }
+    try { return parseTeleports(read('ZckTeleporteur.inc')).map((d) => ({ name: d.name, header: d.name, image: d.image, type: d.type, desc: d.desc, world: d.world, pos: d.pos, items: d.items })); } catch { return []; }
   })();
+  /** lista para a janela: nome, imagem, descrição e os itens que dropam ali (ItemView, para a dica do item) */
+  const teleportView = () => teleports.map((d, k) => ({ k, name: d.name, header: d.header, image: d.image, type: d.type, desc: d.desc,
+    items: d.items.map((s) => inventory?.catalog.bySymbol.get(s)).filter((x) => !!x).map((x) => inventory!.catalog.viewFull(x!)) }));
   const rules = opts.combat ?? null;
   /** ferreiro (upgrade, elemento, piercing, ultimate) — também dá ao combate as joias da ultimate e o fator de elemento */
   const smith = inventory ? new UpgradeRules(inventory.catalog) : null;
@@ -379,6 +408,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
   function removeBuff(c: Conn, skill: number) {
     const p = c.player, cb = c.cb;
     if (!p || !cb || !cb.buffs.delete(skill)) return;
+    if (skill === DARK_ILLUSION) { c.dark = 0; refreshInvis(c); }
     void inventory?.state(p.id).then((st) => { refreshFighter(c, st); send(c.ws, buffsMsg(c)); send(c.ws, statsMsg(c)); void saveBuffs(p.id, cb).catch(() => {}); });
   }
 
@@ -392,9 +422,9 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
   };
 
   /**
-   * Dark Illusion de GM (SI_ACR_SUP_DARKILLUSION): some para quem não é GM/admin (que recebe 'leave'; os GMs recebem
-   * 'invis' e veem translúcido) e os mobs largam o alvo. Desligar faz aparecer de novo ('enter'). O efeito da skill toca
-   * para todos ao sumir e ao aparecer.
+   * Invisível (modo invisível de GM ou a skill Dark Illusion — CHS_INVISIBILITY/TRANSPARENT_MODE do original): some para quem
+   * não é GM/admin (que recebe 'leave'; os GMs recebem 'invis' e veem translúcido) e os mobs largam o alvo. Desligar faz
+   * aparecer de novo ('enter'). O efeito da Dark Illusion toca para todos ao sumir e ao aparecer.
    */
   function setInvis(c: Conn, on: boolean) {
     const p = c.player;
@@ -411,6 +441,22 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     }
     send(c.ws, { t: 'invis', id: p.id, on });
     if (on) W(c).mobs?.forget(p.id); else fx();
+  }
+  const DARK_ILLUSION = 193;
+  /** liga/desliga a invisibilidade conforme o modo de GM e a Dark Illusion (vencida sai) */
+  function refreshInvis(c: Conn) {
+    if (c.dark && c.dark <= Date.now()) c.dark = 0;
+    setInvis(c, !!c.gmInvis || !!c.dark);
+  }
+  /**
+   * A Dark Illusion acaba ao atacar ou lançar outra skill (Ctrl.cpp / MoverActEvent.cpp: RemoveBuff SI_ACR_SUP_DARKILLUSION),
+   * ao vencer o tempo ou ao tirar o buff.
+   */
+  function breakDark(c: Conn) {
+    if (!c.dark) return;
+    c.dark = 0;
+    if (c.cb?.buffs.delete(DARK_ILLUSION)) send(c.ws, buffsMsg(c));
+    refreshInvis(c);
   }
   /** hora do jogo fixada por GM (//time 19), igual para todos; null = o relógio anda (shared/gameclock.ts) */
   let clockFixed: number | null = null;
@@ -472,9 +518,11 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     return false;
   }
 
-  function statsMsg(c: Conn) {
-    const cb = c.cb!, lv = c.player!.level;
-    return { t: 'stats', hp: cb.hp, maxHp: cb.maxHp, mp: cb.mp, maxMp: cb.maxMp, fp: cb.fp, maxFp: cb.maxFp, exp: cb.exp, expMax: rules?.expToNext[lv] ?? 0, level: lv,
+  /** `preview`: atributos de um lutador hipotético (pontos ainda não aplicados, janela de personagem) — só os números */
+  function statsMsg(c: Conn, preview?: Fighter) {
+    const cb0 = c.cb!, lv = c.player!.level;
+    const cb = preview && rules ? { ...cb0, f: preview, maxHp: rules.maxHp(preview), maxMp: rules.maxMp(preview), maxFp: rules.maxFp(preview) } : cb0;
+    return { t: preview ? 'statPreview' : 'stats', hp: cb.hp, maxHp: cb.maxHp, mp: cb.mp, maxMp: cb.maxMp, fp: cb.fp, maxFp: cb.maxFp, exp: cb.exp, expMax: rules?.expToNext[lv] ?? 0, level: lv,
       atkMs: rules?.attackInterval(cb.f, c.player!.mt) ?? 1000, aspd: rules?.attackSpeed(cb.f) ?? 1, atk: rules?.shownAtk(cb.f) ?? [0, 0], atkShow: rules?.shownAtkValue(cb.f) ?? 0, range: rules?.attackRange(cb.f) ?? 2, def: rules?.showDefense(cb.f) ?? 0, crit: rules?.critChance(cb.f) ?? 0, cdmg: rules?.critBonus(cb.f) ?? 0, ...(rules ? rules.panel(cb.f) : {}),
       str: cb.f.base.str, sta: cb.f.base.sta, dex: cb.f.base.dex, int: cb.f.base.int, bonus: { str: cb.f.str - cb.f.base.str, sta: cb.f.sta - cb.f.base.sta, dex: cb.f.dex - cb.f.base.dex, int: cb.f.int - cb.f.base.int },
       acc: rules ? rules.accuracy(cb.f) : 0, dodge: rules ? rules.dodge(cb.f) : 0, spd: rules ? Math.floor(Math.floor(rules.attackSpeed(cb.f) * 100) / 2) : 0, points: cb.points, job: cb.f.job, jobOpts: rules ? rules.jobOptions(cb.f.job, lv) : [],
@@ -794,7 +842,8 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     o.guild = g;
     if (!o.player) return;
     if (g) o.player.guild = g.name; else delete o.player.guild;
-    broadcast({ t: 'guildTag', id: o.player.id, g: g?.name ?? null });
+    if (g?.rank === 0) o.player.gmaster = 1; else delete o.player.gmaster;
+    broadcast({ t: 'guildTag', id: o.player.id, g: g?.name ?? null, ...(g?.rank === 0 ? { m: 1 } : {}) });
   }
   const guildNotice = (guildId: number, text: string) => { for (const o of conns) if (o.guild?.id === guildId) send(o.ws, { t: 'chat', id: 0, name: '', text }); };
 
@@ -1116,6 +1165,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     const p = c.player, cb = c.cb;
     if (!p || !cb || !rules || !mobWorld || cb.dead) return;
     const m = mobWorld.byId.get(mobId);
+    if (m && m.s !== 'dead') breakDark(c); // golpear desfaz a Dark Illusion
     if (!m || m.s === 'dead' || !m.prop) return;
     const now = Date.now();
     if (now < cb.nextAtk - 120) return; // rápido demais (com folga de rede)
@@ -1241,7 +1291,12 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     if (!changed) return;
     void inventory?.state(c.player!.id).then((st) => { refreshFighter(c, st); send(c.ws, buffsMsg(c)); });
   }
-  const buffTick = setInterval(() => { for (const c of conns) if (c.cb?.buffs.size) expireBuffs(c); }, 1000);
+  const buffTick = setInterval(() => {
+    for (const c of conns) {
+      if (c.dark && c.dark <= Date.now()) breakDark(c);
+      if (c.cb?.buffs.size) expireBuffs(c);
+    }
+  }, 1000);
   http.on('close', () => clearInterval(buffTick));
 
   /**
@@ -1271,6 +1326,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     }
     if (cb.mp < L.mp || cb.fp < L.fp) { reply(c, L.mp > cb.mp ? 'MP insuficiente.' : 'FP insuficiente.'); return; }
     cb.mp -= L.mp; cb.fp -= L.fp; cb.dirty = true;
+    if (skillId !== DARK_ILLUSION) breakDark(c); // outra skill desfaz a Dark Illusion
     const cd = Math.max(L.cooldown || 0, s.kind === 'buff' ? 1000 : 1500);
     cb.skillReady.set(skillId, now + cd);
     send(c.ws, { t: 'skillUsed', id: skillId, cd });
@@ -1308,6 +1364,14 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
           }
         } else if (dur) dst.push([k, v]);
       }
+      if (skillId === DARK_ILLUSION && dur) {
+        // Dark Illusion: some pelo tempo da skill (CMover::SetDarkCover); o ícone fica na barra de buffs (sem DST, não é guardado)
+        cb.buffs.set(skillId, { lv, until: now + dur, dst: [] });
+        send(c.ws, buffsMsg(c));
+        c.dark = now + dur;
+        refreshInvis(c);
+        return;
+      }
       if (dur && dst.length) {
         cb.buffs.set(skillId, { lv, until: now + dur, dst });
         void inventory?.state(p.id).then((st) => { refreshFighter(c, st); send(c.ws, buffsMsg(c)); });
@@ -1328,6 +1392,95 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     if (killer?.player) { rewardKill(killer, m!.prop!, m!.x, m!.z); dropLoot(m!, killer); }
   }
 
+  // ---------- pet coletor (CAIPet + __SYS_PETFILTER do Titanium) ----------
+  /** o pet procura itens até 20 unidades do dono (CAIPet::SubItemLoot), corre a ~8 u/s e procura de novo a cada 0,3 s */
+  const PET_RANGE = 20, PET_SPEED = 8;
+  /** item IK3_PET: chama o pet (dwLinkKind = MI_* que aparece) ou recolhe se é o mesmo; outro pet troca */
+  function togglePet(c: Conn, item: number, mover: number) {
+    const p = c.player;
+    if (!p) return;
+    const same = c.pet?.item === item;
+    c.pet = same ? undefined : { item, mover, busy: 0, skip: new Set() };
+    p.pet = same ? undefined : mover;
+    const msg = { t: 'pet', a: p.id, m: same ? 0 : mover };
+    send(c.ws, msg);
+    broadcast(msg, c, p.w);
+  }
+  /** manda o filtro com nome e ícone dos itens das listas */
+  function sendPetFilter(c: Conn) {
+    const f = c.petFilter ?? emptyPetFilter(), n: Record<number, [string, string]> = {};
+    for (const id of [...f.white, ...f.black]) { const d = inventory?.catalog.byId.get(id); if (d) n[id] = [d.name, d.icon]; }
+    send(c.ws, { t: 'petFilter', f, n });
+  }
+  /** o filtro deixa o pet pegar este item? (CUser::ShouldPickUp + listas branca e negra) */
+  function petWants(c: Conn, itemId: number, gold: number): boolean {
+    if (gold > 0) return true;
+    const f = c.petFilter ?? emptyPetFilter(), d = inventory?.catalog.byId.get(itemId);
+    if (!d) return false;
+    if (f.white.includes(d.id)) return true;
+    if (f.black.includes(d.id)) return false;
+    const b = f.bits, sym = d.symbol, has = (bit: number) => (b & bit) !== 0;
+    const job = c.player?.job ?? 0;
+    if (has(FILTER.HPFOOD) && d.kind2 === D('IK2_FOOD')) return false;
+    if (has(FILTER.MPFOOD) && d.kind3 === D('IK3_REFRESHER')) return false;
+    if (has(FILTER.FPFOOD) && (d.kind2 === D('IK2_POTION') || d.kind3 === D('IK3_DRINK'))) return false;
+    if (has(FILTER.BWEAPON) && d.kind1 === D('IK1_WEAPON') && d.referStat1 !== 1) return false;
+    if (has(FILTER.GWEAPON) && d.kind1 === D('IK1_WEAPON') && d.referStat1 === 1) return false;
+    if (has(FILTER.ULT_WEAP) && d.referStat1 === 2) return false;
+    if (has(FILTER.BSET) && d.kind1 === D('IK1_ARMOR') && d.referStat1 !== 3) return false;
+    if (has(FILTER.GSET) && d.referStat1 === 3) return false;
+    if (has(FILTER.NECKLACE) && d.kind3 === D('IK3_NECKLACE')) return false;
+    if (has(FILTER.EARRING) && d.kind3 === D('IK3_EARRING')) return false;
+    if (has(FILTER.RING) && d.kind3 === D('IK3_RING')) return false;
+    if (has(FILTER.EGG) && sym === 'II_PET_EGG') return false;
+    if (has(FILTER.SUNSTONE) && /^II_(GEN_MAT_ORICHALCUM0[12](_1)?|SYS_SYS_SCR_SCRAPORICHALCUM)$/.test(sym)) return false;
+    if (has(FILTER.MOONSTONE) && /^II_(GEN_MAT_MOONSTONE(_1)?|SYS_SYS_SCR_SCRAPMOONSTONE)$/.test(sym)) return false;
+    if (has(FILTER.QUESTITEM) && (d.kind2 === D('IK2_GEM') || d.kind3 === D('IK3_GEM') || d.kind3 === D('IK3_EVENTSUB'))) return false;
+    if (has(FILTER.CRAFT_MAT) && d.kind3 === D('IK3_CRAFTING_MAT')) return false;
+    if (has(FILTER.ELECARDS) && d.kind3 === D('IK3_ELECARD')) return false;
+    if (has(FILTER.CARD4P) && /^II_GEN_MAT_ELE_(MAGMA|FLOOD|STORM|THUNDER|MOUNTAIN)$/.test(sym)) return false;
+    if (has(FILTER.CARD7P) && /^II_GEN_MAT_ELE_(EARTHQUAKE|LIGHTING|VACCUM|OCEAN|VOLCANO)$/.test(sym)) return false;
+    if (has(FILTER.BPIECARD) && /^II_GEN_MAT_ELE_(CANDLE|RAINATK|BREEZEATK|SPARKATK|SANDATK)B$/.test(sym)) return false;
+    if (has(FILTER.APIECARD) && /^II_GEN_MAT_ELE_(CANDLE|RAINATK|BREEZEATK|SPARKATK|SANDATK)A$/.test(sym)) return false;
+    if (has(FILTER.MALE) && d.sex === 0) return false;
+    if (has(FILTER.FEMALE) && d.sex === 1) return false;
+    if (has(FILTER.JEWELS) && d.kind2 === D('IK2_MATERIAL') && d.kind3 === D('IK3_ULTIMATE')) return false;
+    const weapon = d.kind1 === D('IK1_WEAPON') || d.kind3 === D('IK3_SHIELD'), armor = d.kind1 === D('IK1_ARMOR') && d.kind3 !== D('IK3_SHIELD');
+    if (has(FILTER.OTHER_WEAP) && weapon && !jobCanUse(d.job, job)) return false;
+    if (has(FILTER.OTHER_ARM) && armor && !jobCanUse(d.job, job)) return false;
+    // raridade mínima: os drops ainda não sorteiam raridade (são todos Common), então só "Common" ou desligado deixa pegar
+    if (f.wr > 0 && weapon) return false;
+    if (f.ar > 0 && armor) return false;
+    return true;
+  }
+  /** a cada 0,3 s: cada pet livre vai buscar o item mais perto do dono que ele pode pegar */
+  const petTick = setInterval(() => {
+    const now = Date.now();
+    for (const c of conns) {
+      const p = c.player, pet = c.pet;
+      if (!p || !pet || pet.busy > now || c.cb?.dead || c.switching || p.s.startsWith('fly')) continue;
+      let best: GroundItem | null = null, bestD = PET_RANGE;
+      for (const g of ground.values()) {
+        if (g.w !== p.w || pet.skip.has(g.id)) continue;
+        const dist = Math.hypot(g.x - p.p[0], g.z - p.p[2]);
+        if (dist >= bestD || (g.owner !== p.id && now < g.ownerUntil) || !petWants(c, g.itemId, g.gold)) continue;
+        best = g; bestD = dist;
+      }
+      if (!best) continue;
+      const g = best, ms = Math.round((bestD / PET_SPEED) * 1000) + 250;
+      pet.busy = now + ms + 300;
+      sendNear(p.w, g.x, g.z, { t: 'petGo', a: p.id, x: g.x, z: g.z, ms });
+      setTimeout(() => {
+        if (c.pet !== pet || !c.player || ground.get(g.id) !== g || c.player.w !== g.w) return;
+        ground.delete(g.id);
+        c.invQueue = c.invQueue.then(async () => {
+          const left = await giveLoot(c, g.itemId, g.count, g.upgrade, g.gold);
+          if (left > 0) { g.count = left; ground.set(g.id, g); pet.skip.add(g.id); } // bolsa cheia: não fica tentando
+        }).catch((e) => { console.error('realtime: pet pegar item', e); ground.set(g.id, g); });
+      }, ms);
+    }
+  }, 300);
+
   /**
    * Usa o item do espaço `slot` da bolsa (CMover::DoUseItem / DoUseItemFood): poção, comida e refresher curam HP/MP/FP
    * pelo dwDestParam/nAdjParamVal; acima do limite dwAbilityMin a cura cai para 30 %; espera dwSkillReady (mín. 1 s) por grupo.
@@ -1341,6 +1494,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
       const d = it && inventory.catalog.byId.get(it.id);
       if (!d) return;
       if (d.kind3 === 122 && await useTicket(c, slot, d.symbol)) return; // IK3_TICKET: viagem para outro mapa (Azria)
+      if (d.kind3 === D('IK3_PET') && d.linkKind) { togglePet(c, d.id, d.linkKind); return; } // pet coletor: chama / recolhe
       if (it.x && it.x <= Date.now()) { send(c.ws, { t: 'invError', error: `${d.name} expirou.` }); return; }
       // caixa (propPackItem.inc): tudo o que vem dentro vai para a bolsa
       if (inventory.catalog.packs.has(d.id)) {
@@ -1547,8 +1701,8 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     const s = opts.resolveSession ? (tok ? await opts.resolveSession(tok) : null) : sessionFrom(tok);
     if (!s) { send(c.ws, { t: 'error', error: 'Sessão expirada. Entre novamente.' }); c.ws.close(); return; }
     const r = await query<{ id: string; name: string; sex: number; hair_mesh: number; hair_color: number; head_mesh: number; level: number; job: number; pos_x: number; pos_y: number; pos_z: number; angle: number;
-      str: number; sta: number; dex: number; int: number; hp: number; mp: number; fp: number; exp: string; stat_points: number; shortcuts: unknown; skills: Record<string, number>; skill_points: number; world_id: number }>(
-      'SELECT id, name, sex, hair_mesh, hair_color, head_mesh, level, job, pos_x, pos_y, pos_z, angle, world_id, str, sta, dex, "int", hp, mp, fp, exp, stat_points, shortcuts, skills, skill_points FROM characters WHERE id = $1 AND account_id = $2 AND NOT deleted',
+      str: number; sta: number; dex: number; int: number; hp: number; mp: number; fp: number; exp: string; stat_points: number; shortcuts: unknown; skills: Record<string, number>; skill_points: number; world_id: number; pet_filter: unknown }>(
+      'SELECT id, name, sex, hair_mesh, hair_color, head_mesh, level, job, pos_x, pos_y, pos_z, angle, world_id, str, sta, dex, "int", hp, mp, fp, exp, stat_points, shortcuts, skills, skill_points, pet_filter FROM characters WHERE id = $1 AND account_id = $2 AND NOT deleted',
       [Number(msg.characterId), s.accountId]);
     const ch = r.rows[0];
     if (!ch) { send(c.ws, { t: 'error', error: 'Personagem não encontrado nesta conta.' }); c.ws.close(); return; }
@@ -1568,7 +1722,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     const wr = [...worlds.values()].find((x) => x.id === ch.world_id) ?? null;
     const wname = wr?.name ?? MAIN;
     const pStart = wr ? (inWorld(p0) ? p0 : [ch.pos_x, ch.pos_y, ch.pos_z]) : [...REVIVE_AT];
-    c.player = { w: wname, ...(guildRow ? { guild: guildRow.name } : {}), id, name: ch.name, sex: ch.sex, hair: ch.hair_mesh, ...(ch.hair_color ? { hc: ch.hair_color } : {}), head: ch.head_mesh, level: ch.level, p: pStart as [number, number, number], h: ch.angle, s: 'stand', eq: inv ? inventory!.looks(inv, c.hide) : [], job: ch.job, mt: stanceOf(c, inv ? inventory!.combatMotion(inv, ch.job) : 0), rank };
+    c.player = { w: wname, ...(guildRow ? { guild: guildRow.name } : {}), ...(guildRow?.rank === 0 ? { gmaster: 1 as const } : {}), id, name: ch.name, sex: ch.sex, hair: ch.hair_mesh, ...(ch.hair_color ? { hc: ch.hair_color } : {}), head: ch.head_mesh, level: ch.level, p: pStart as [number, number, number], h: ch.angle, s: 'stand', eq: inv ? inventory!.looks(inv, c.hide) : [], job: ch.job, mt: stanceOf(c, inv ? inventory!.combatMotion(inv, ch.job) : 0), rank };
     if (rules) {
       const okJob = jobForLevel(ch.job, ch.level);
       if (okJob !== ch.job) { // nível abaixo do da classe (mexido fora do jogo): volta para a classe que o nível permite
@@ -1587,6 +1741,8 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     }
     c.onlineSet = query('UPDATE characters SET online = true WHERE id = $1', [id]).then(() => {}, () => {}); // o site mostra quem está online
     const me = c.player;
+    c.petFilter = cleanPetFilter(ch.pet_filter);
+    sendPetFilter(c);
     send(c.ws, { t: 'clock', now: Date.now(), fixed: clockFixed });
     send(c.ws, { t: 'welcome', id, w: me.w, p: me.p, eq: me.eq, mt: me.mt, players: [...conns].filter((o) => o !== c && o.player && o.player.w === me.w && seesActor(c, o.player.id)).map((o) => o.player) });
     // GM/admin entra imortal (pode desligar com //god off ou no painel)
@@ -1703,9 +1859,17 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
             online: (name) => { for (const o of conns) if (o.player && o.player.name.toLowerCase() === name.toLowerCase()) return { id: o.player.id, name: o.player.name, level: o.player.level, p: [...o.player.p] }; return null; },
             openPanel: () => send(ws, { t: 'gmOpen' }),
             invis: (on) => {
-              const want = on ?? !c.invis;
-              setInvis(c, want);
-              return want ? 'Dark Illusion: você está invisível para os jogadores (GMs e admins ainda veem você).' : 'Dark Illusion desligada: todos veem você de novo.';
+              c.gmInvis = on ?? !c.gmInvis;
+              refreshInvis(c);
+              return c.gmInvis ? 'Modo invisível: os jogadores não veem você (GMs e admins ainda veem).' : c.invis ? 'Modo invisível desligado (a Dark Illusion ainda está ativa).' : 'Modo invisível desligado: todos veem você de novo.';
+            },
+            drop: (itemId, n) => {
+              const p = c.player!, now = Date.now(), name = inventory?.catalog.byId.get(itemId)?.name ?? 'Item';
+              for (let i = 0; i < n; i++) {
+                const a = Math.random() * Math.PI * 2, r = 3 + Math.random() * 6;
+                ground.set(++groundSeq, { w: p.w, id: groundSeq, itemId, count: 1, upgrade: 0, gold: 0, x: p.p[0] + Math.cos(a) * r, z: p.p[2] + Math.sin(a) * r, owner: 0, ownerUntil: 0, expires: now + GROUND_MS });
+              }
+              return `${n}× ${name} no chão.`;
             },
             time: (hour) => {
               clockFixed = hour;
@@ -1841,6 +2005,8 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
         npcBuff(c, msg.key.slice(0, 40));
       } else if (msg.t === 'buffOff' && c.player && Number.isInteger(msg.id)) {
         removeBuff(c, msg.id as number);
+      } else if (msg.t === 'teleports') {
+        send(ws, { t: 'teleports', list: teleportView() });
       } else if (msg.t === 'zckTeleport' && c.player && Number.isInteger(msg.k)) {
         zckTeleport(c, msg.k as number);
       } else if (msg.t === 'hide' && c.player && inventory && Number.isInteger(msg.m)) {
@@ -1870,6 +2036,23 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
         cb.f.str += s; cb.f.sta += t; cb.f.dex += d; cb.f.int += i;
         recalcMax(c);
         void saveCombat(c.player.id, cb, c.player.level).catch((e) => console.error('realtime: salvar atributos', e));
+      } else if (msg.t === 'statPreview' && c.player && c.cb) {
+        // como ficaria com os pontos ainda não aplicados (a janela pisca o que muda); nada é gravado
+        const add = (['str', 'sta', 'dex', 'int'] as const).map((k) => msg[k]);
+        if (!add.every((v) => Number.isInteger(v) && (v as number) >= 0)) return;
+        const [s, t, d, i] = add as number[];
+        if (s + t + d + i > c.cb.points) return;
+        const f0 = c.cb.f;
+        const f: Fighter = { ...f0, base: { ...f0.base, str: f0.base.str + s, sta: f0.base.sta + t, dex: f0.base.dex + d, int: f0.base.int + i }, str: f0.str + s, sta: f0.sta + t, dex: f0.dex + d, int: f0.int + i };
+        send(ws, statsMsg(c, f));
+      } else if (msg.t === 'petFilter' && c.player) {
+        c.petFilter = cleanPetFilter(msg.f);
+        void query('UPDATE characters SET pet_filter = $2 WHERE id = $1', [c.player.id, JSON.stringify(c.petFilter)]).catch((e) => console.error('realtime: filtro do pet', e));
+        c.pet?.skip.clear();
+        sendPetFilter(c);
+      } else if (msg.t === 'petFind' && c.player && inventory) {
+        const q = typeof msg.q === 'string' ? msg.q.slice(0, 40) : '';
+        send(ws, { t: 'petFind', list: q.trim().length < 2 ? [] : inventory.catalog.search(q, '', 0, 40).map((d) => [d.id, d.name, d.icon]) });
       } else if (msg.t === 'pick' && c.player) {
         if (Number.isInteger(msg.id)) pickUp(c, msg.id as number);
       } else if (msg.t === 'atk' && c.player) {
@@ -2042,7 +2225,7 @@ export function attachRealtime(http: Server, opts: RealtimeOptions = {}) {
     }
   }, 15000);
 
-  http.on('close', () => { clearInterval(tick); clearInterval(ping); clearInterval(partyTick); wss.close(); });
+  http.on('close', () => { clearInterval(tick); clearInterval(ping); clearInterval(petTick); clearInterval(partyTick); wss.close(); });
   return {
     online: () => [...conns].filter((c) => c.player).length,
     /** retrato para o painel admin */

@@ -19,6 +19,9 @@ import { SmithWindow, smithOptions, isUpgradeMaterial } from './smith';
 import { ShopWindow } from './shop';
 import { SkillWindow } from './skillwnd';
 import { JobWindow } from './jobwnd';
+import { CaptionBanner } from './caption';
+import { Pets } from './pets';
+import { PetFilterWindow } from './petfilter';
 import { BuffBar } from './buffbar';
 import { PartyBuffs } from './partybuffs';
 import { TradeWindow } from './trade';
@@ -111,6 +114,7 @@ const inventory = new InventoryWindow(document.body);
 /** Teleporter (tecla V, como o APP_ZCK_TELEPORTEUR do cliente) */
 const teleportWnd = new TeleportWindow(document.body);
 teleportWnd.onTeleport = (k) => { if (!net.zckTeleport(k)) chat.system('Sem conexão com o servidor.'); };
+teleportWnd.onLoad = () => net.teleports();
 /** janela de movimentos (tecla O): movimento no personagem (os outros veem pelo servidor) e emoticon acima da cabeça */
 const motionWnd = new MotionWindow(document.body);
 hud.onMotion = () => motionWnd.toggle();
@@ -147,6 +151,7 @@ shopWnd.onSell = (k, s, n) => { if (!net.shopSell(k, s, n)) chat.system('Sem con
 let npcGoing: { inst: MoverInstance; key: string; next: number; best?: number; since?: number } | null = null;
 let shopNpc: [number, number] | null = null;
 charWnd.onApply = (add) => { if (!net.statUp(add)) chat.system('Sem conexão com o servidor.'); };
+charWnd.onPreview = (add) => { net.statPreview(add); };
 /** painel de GM (//gm no chat; o servidor só abre para contas GM/admin) */
 const gmPanel = new GmPanel(document.body);
 gmPanel.run = (cmd) => net.sendChat(cmd);
@@ -159,6 +164,9 @@ gmPanel.monsters = () => {
 gmPanel.search = (q, k, g) => { net.gmItems(q, k, g); };
 /** outros jogadores (WebSocket /ws) */
 const remotes = new RemotePlayers(view);
+// pet coletor (o seu e o dos outros): segue o dono e corre até o item que o servidor manda pegar
+const pets = new Pets(view, (id) => (id === net.myId ? (view.player ? [...view.player.pos] as [number, number, number] : null) : remotes.pos(id)));
+const petFilterWnd = new PetFilterWindow(document.body);
 const net = new NetClient(remotes);
 let inGame = false;
 // versão nova do jogo no servidor: recarrega fora do mundo, avisa dentro dele (client/version.ts)
@@ -188,6 +196,9 @@ net.onSkillUsed = (id, cd) => {
   actionBar.cooldown(id, cd, 'skill');
   const s = skillWnd.get(id);
   if (s?.kind === 'buff' && s.mo) view.player?.cast(s.mo); // o servidor aceitou: toca o movimento de lançar o buff
+  // Dark Illusion: o aviso vermelho na altura da cintura, como o "You use Dark Illusion." do original
+  const p = view.player?.pos;
+  if (s?.sym === 'SI_ACR_SUP_DARKILLUSION' && p) combat.popup([p[0], p[1] + 0.9, p[2]], 'Você usou Dark Illusion.', 'notice');
 };
 /** atalho de skill: lança no mob selecionado (anda até o alcance) */
 actionBar.onUseSkill = (id) => {
@@ -266,6 +277,8 @@ function npcFrame(now: number) {
     }
     else { p.stop(); p.face(nx, nz); menuNpc = npcGoing; net.npcMenu(npcGoing.key); shopNpc = [nx, nz]; npcGoing = null; }
   }
+  // NPC com o menu, a loja ou o ferreiro aberto para de trabalhar (stand calmo) até fechar
+  view.moverMgr.attending = menuNpc && (npcMenu.visible || shopWnd.visible || smithWnd.visible) ? menuNpc.inst : null;
   // fecha o menu ao se afastar além do alcance de conversa do servidor (12 m)
   if (npcMenu.visible && shopNpc && Math.hypot(shopNpc[0] - p.pos[0], shopNpc[1] - p.pos[2]) > 12) npcMenu.hide();
   if (shopWnd.visible && shopNpc && Math.hypot(shopNpc[0] - p.pos[0], shopNpc[1] - p.pos[2]) > 14) { shopWnd.hide(); shopNpc = null; }
@@ -337,7 +350,7 @@ net.onChangeWorld = (w, p) => {
     await view.spawnPlayer(p[0], p[2], p[1], sex, look);
     if (view.player) view.player.runSpeed = moveSpeed;
     const ch = characters.find((c) => c.slot === selectedSlot);
-    if (ch) { view.player?.inst?.setLabel(ch.name, rankOf(account?.authority), PLAYER_LABEL_LIFT); view.player?.inst?.setGuildTag(myGuild); }
+    if (ch) { view.player?.inst?.setLabel(ch.name, rankOf(account?.authority), PLAYER_LABEL_LIFT); view.player?.inst?.setGuildTag(myGuild, myGuildMaster); }
     void view.player?.setCombat(combatMt);
     view.playerControl = true;
     net.resume();
@@ -459,6 +472,7 @@ net.onGetUp = () => {
 };
 /** velocidade de corrida do personagem (u/s), vinda do servidor; aplicada também ao nascer */
 let moveSpeed = 6;
+net.onStatPreview = (s) => charWnd.setPreview(s);
 net.onStats = (s) => {
   const ch = characters.find((c) => c.slot === selectedSlot);
   if (!ch) return;
@@ -476,18 +490,20 @@ net.onStats = (s) => {
   charWnd.setStats(s);
   jobWnd.setOptions(s.jobOpts ?? []);
 };
-net.onReset = () => { deathScreen(false); view.moverMgr.clearExternal(); ground.clear(); friendsWnd.clear(); partyWnd.set(null, 0); partyBuffs.set(null); guildWnd.set(null, 0); myGuild = null; myInvis = false; gmPanel.setInvis(false); tradeWnd.close(); };
+net.onReset = () => { deathScreen(false); pets.clear(); view.moverMgr.clearExternal(); ground.clear(); friendsWnd.clear(); partyWnd.set(null, 0); partyBuffs.set(null); guildWnd.set(null, 0); myGuild = null; myGuildMaster = false; myInvis = false; gmPanel.setInvis(false); tradeWnd.close(); };
 /** guild (tecla G); o nome da sua guild fica acima do seu nome */
 const guildWnd = new GuildWindow(document.body);
 let myGuild: string | null = null;
+/** você é o mestre da guild (nome da guild dourado) */
+let myGuildMaster = false;
 hud.onGuild = () => guildWnd.toggle();
 guildWnd.onOpen = () => net.guild('guildInfo');
 guildWnd.onCreate = (name) => net.guild('guildCreate', { name });
 guildWnd.onLeave = () => net.guild('guildLeave');
 guildWnd.onKick = (id) => net.guild('guildKick', { id });
 guildWnd.onDisband = () => net.guild('guildDisband');
-net.onGuildView = (g) => { guildWnd.set(g, net.myId); net.onMyGuildTag(g?.name ?? null); };
-net.onMyGuildTag = (g) => { myGuild = g; view.player?.inst?.setGuildTag(g); };
+net.onGuildView = (g) => { guildWnd.set(g, net.myId); net.onMyGuildTag(g?.name ?? null, !!g && g.master === net.myId); };
+net.onMyGuildTag = (g, master) => { myGuild = g; myGuildMaster = master; view.player?.inst?.setGuildTag(g, master); };
 net.onGuildReq = (id, name, guild) => friendRequestPrompt(document.body, name, (ok) => net.guild('guildAnswer', { id, ok }), `${name} convidou você para a guild ${guild}.`);
 /** party (tecla P) e lista de partys (tecla L) */
 const partyWnd = new PartyWindow(document.body);
@@ -496,6 +512,9 @@ const partyListWnd = new PartyListWindow(document.body);
 const miniMap = new MiniMap(document.body);
 const worldMap = new WorldMap(document.body);
 miniMap.onClose = () => navOpen(false);
+// GM/admin: duplo clique no mini mapa teleporta na hora para o ponto (//tp; o servidor confere a autoridade)
+miniMap.canTeleport = () => !!rankOf(account?.authority);
+miniMap.onTeleport = (x, z) => { if (!net.sendChat(`//tp ${x} ${z}`)) chat.system('Sem conexão com o servidor.'); };
 /** o mini mapa começa aberto; fechar (N ou ×) fica lembrado neste navegador */
 function navOpen(set?: boolean): boolean {
   try { if (set !== undefined) localStorage.setItem('flyff.nav.open', set ? '1' : '0'); return localStorage.getItem('flyff.nav.open') !== '0'; } catch { return set ?? true; }
@@ -558,6 +577,8 @@ net.onChat = (id, name, text) => {
 };
 // anúncio do painel admin: letreiro no meio da tela e uma cópia no chat (para quem perdeu)
 const announcer = new Announcer(document.body);
+/** faixa de aviso no alto da tela (Level Up!) */
+const caption = new CaptionBanner(document.body);
 net.onAnnounce = (text, loops) => { announcer.show(text, loops); chat.system(`[Aviso] ${text}`); };
 net.onGmOpen = () => gmPanel.show();
 net.onGmItems = (list) => gmPanel.setResults(list);
@@ -718,10 +739,27 @@ inventory.onHide = (mask) => {
 };
 // nível mudado por GM: atualiza o personagem e a janela de status (HP/MP/FP cheios com os máximos novos)
 // nível novo (GM ou exp): os valores certos chegam logo depois em `stats`
-net.onLevel = (level) => { const ch = characters.find((c) => c.slot === selectedSlot); if (ch) ch.level = level; };
+net.onLevel = (level) => {
+  const ch = characters.find((c) => c.slot === selectedSlot), up = !!ch && level > ch.level;
+  if (ch) ch.level = level;
+  if (!up) return;
+  // subiu de nível (CMover::SetLevel/AddExperience no cliente): a faixa "Level Up!", o pilar de luz e o movimento
+  caption.show('Level Up!');
+  levelUpFx(net.myId);
+  chat.system(`Parabéns! Você chegou ao nível ${level}.`);
+};
+/** XI_GEN_LEVEL_UP01 (o pilar de luz) no personagem e MTI_LEVELUP se estiver parado */
+function levelUpFx(id: number) {
+  const p = id === net.myId ? view.player?.pos ?? null : remotes.pos(id);
+  if (!p) return;
+  view.playSfx(42, [p[0], p[1], p[2]]);
+  if (id !== net.myId) remotes.cast(id, 'MTI_LEVELUP');
+  else if (view.player?.animState === 'stand') view.player.cast('MTI_LEVELUP');
+}
+net.onLevelUp = (id) => levelUpFx(id);
 /** troca o equipamento visível do personagem local (recoloca o nome na instância nova) */
 let combatMt = 0, lookNow: string[] = [];
-/** você está com a Dark Illusion de GM ligada (invisível para os jogadores): seu boneco fica translúcido */
+/** você está invisível (modo invisível de GM ou Dark Illusion): seu boneco fica translúcido */
 let myInvis = false;
 net.onInvis = (on) => { myInvis = on; view.player?.inst?.setGhost(on); gmPanel.setInvis(on); };
 net.onGod = (on) => gmPanel.setGod(on);
@@ -729,6 +767,13 @@ net.onGod = (on) => gmPanel.setGod(on);
 // ---------- dia e noite (shared/gameclock.ts: dia 6h–19h em 21,6 min e noite em 7,2 min reais, igual para todos) ----------
 /** diferença entre o relógio do servidor e o deste computador; hora fixada pelo GM (//time) */
 let clockOffset = 0, clockFixed: number | null = null;
+net.onTeleports = (list) => teleportWnd.set(list);
+net.onPet = (a, m) => pets.set(a, m);
+net.onPetGo = (a, x, z, ms) => pets.go(a, x, z, ms);
+net.onPetFilter = (f, n) => petFilterWnd.set(f, n);
+net.onPetFind = (list) => petFilterWnd.found(list);
+petFilterWnd.onSave = (f) => { if (!net.petFilter(f)) chat.system('Sem conexão com o servidor.'); };
+petFilterWnd.onFind = (q) => { net.petFind(q); };
 net.onClock = (now, fixed) => { clockOffset = now - Date.now(); clockFixed = fixed; tickClock(); };
 /** a cada minuto do jogo (1,2 s) muda a hora do mundo: céu (dia/entardecer/noite), nuvens, sol/lua, luz, névoa e lampiões */
 function tickClock() {
@@ -744,7 +789,7 @@ async function restyle(eq: string[]) {
   lookNow = eq;
   const inst = await view.player?.restyle(eq);
   const ch = characters.find((c) => c.slot === selectedSlot);
-  if (inst && ch) { inst.setLabel(ch.name, rankOf(account?.authority), PLAYER_LABEL_LIFT); inst.setGuildTag(myGuild); }
+  if (inst && ch) { inst.setLabel(ch.name, rankOf(account?.authority), PLAYER_LABEL_LIFT); inst.setGuildTag(myGuild, myGuildMaster); }
   if (inst && myInvis) inst.setGhost(true);
   updateInvPreview();
 }
@@ -761,6 +806,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyI' && !e.repeat) inventory.toggle();
   else if (e.code === 'KeyH' && !e.repeat) charWnd.toggle();
   else if (e.code === 'KeyK' && !e.repeat) skillWnd.toggle();
+  else if (e.code === 'KeyU' && !e.repeat) petFilterWnd.toggle(); // filtro do pet coletor
   else if (e.code === 'KeyJ' && !e.repeat) jobWnd.toggle(); // reabre a escolha de classe, se ainda há
   else if (e.code === 'KeyC' && !e.repeat) runActionSlot();
   else if (e.code === 'KeyV' && !e.repeat) teleportWnd.toggle();
@@ -930,6 +976,7 @@ view.onFrame = (dt) => {
   if (previewing) view.player?.preview(dt, 0);
   if (inGame) {
     remotes.frame(dt);
+    pets.update(dt);
     const p = view.player;
     combat.frame(performance.now());
     ground.frame(performance.now());
@@ -941,7 +988,7 @@ view.onFrame = (dt) => {
 };
 view.start();
 // testes: com `?debug` no endereço, o console enxerga o mundo e a rede (window.__flyff)
-if (new URLSearchParams(location.search).has('debug')) (window as unknown as Record<string, unknown>).__flyff = { view, net, combat, inventory };
+if (new URLSearchParams(location.search).has('debug')) (window as unknown as Record<string, unknown>).__flyff = { view, net, combat, inventory, pets };
 
 // ---------- tela de carregamento (antes do login) ----------
 /**
@@ -1328,7 +1375,7 @@ async function enter() {
   try { queue = JSON.parse(localStorage.getItem(`flyff.queue.${ch.id}`) ?? '[]') as (BarItem | null)[]; } catch { /* sem armazenamento */ }
   actionBar.setQueue(Array.isArray(queue) ? queue : []);
   view.player?.inst?.setLabel(ch.name, rankOf(account.authority), PLAYER_LABEL_LIFT);
-  view.player?.inst?.setGuildTag(myGuild);
+  view.player?.inst?.setGuildTag(myGuild, myGuildMaster);
   view.labelRenderer.domElement.hidden = false;
   view.playerControl = true;
   $('charScreen').hidden = true;

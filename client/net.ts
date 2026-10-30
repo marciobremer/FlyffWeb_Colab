@@ -16,7 +16,7 @@ import type { GroundRow } from './ground';
  * O próprio jogador manda posição/rumo/estado no máximo 10×/s e só quando muda; os remotos chegam 10×/s e são suavizados
  * a cada quadro (interpolação exponencial da posição e do rumo), com as mesmas animações do jogador local.
  */
-export interface PlayerView { /** nome da guild */ guild?: string; id: number; name: string; sex: number; hair: number; head: number; /** cor do cabelo (0xAARRGGBB; 0 = padrão da malha) */ hc?: number; level: number; p: [number, number, number]; h: number; s: string; /** símbolos II_* equipados */ eq?: string[]; /** postura de combate 1–15 (0 = normal) */ mt?: number; /** 'admin' ou 'gm' (cor do nome) */ rank?: string; /** GM invisível (só GMs recebem): translúcido */ iv?: 1 }
+export interface PlayerView { /** nome da guild */ guild?: string; id: number; name: string; sex: number; hair: number; head: number; /** cor do cabelo (0xAARRGGBB; 0 = padrão da malha) */ hc?: number; level: number; p: [number, number, number]; h: number; s: string; /** símbolos II_* equipados */ eq?: string[]; /** postura de combate 1–15 (0 = normal) */ mt?: number; /** 'admin' ou 'gm' (cor do nome) */ rank?: string; /** GM invisível (só GMs recebem): translúcido */ iv?: 1; /** pet coletor seguindo (MI_*) */ pet?: number; /** mestre da guild (nome da guild dourado) */ gmaster?: 1 }
 
 /** seus atributos (server/realtime.ts statsMsg) */
 export interface PlayerStats {
@@ -111,7 +111,7 @@ export class RemotePlayers {
     inst.setHairColor(hairRgb(r.view.hc ?? 0, sex, r.view.hair || 1));
     applyEnchantGlow(inst, r.view.eq ?? [], sex, d, false);
     inst.setLabel(r.view.name, r.view.rank, PLAYER_LABEL_LIFT);
-    inst.setGuildTag(r.view.guild);
+    inst.setGuildTag(r.view.guild, !!r.view.gmaster);
     if (this.partyIds.has(r.view.id)) inst.label?.element.classList.add('party');
     if (r.view.iv) inst.setGhost(true); // GM invisível (só GMs recebem)
     inst.play(...motionOf(r.s, r.view.mt ?? 0));
@@ -155,6 +155,15 @@ export class RemotePlayers {
   clear() { for (const id of [...this.list.keys()]) this.remove(id); }
 
   /** GM ficou invisível / visível (só chega a quem é GM/admin): fica translúcido */
+  /** nível de outro jogador mudou; true se subiu (efeito de level up) */
+  setLevel(id: number, level: number) {
+    const r = this.list.get(id);
+    if (!r) return false;
+    const up = level > r.view.level;
+    r.view.level = level;
+    return up;
+  }
+
   setInvis(id: number, on: boolean) {
     const r = this.list.get(id);
     if (!r) return;
@@ -227,11 +236,12 @@ export class RemotePlayers {
   instOf(id: number) { return this.list.get(id)?.inst ?? null; }
 
   /** a guild de um jogador mudou: nome da guild acima do nome dele */
-  guildTag(id: number, g: string | null) {
+  guildTag(id: number, g: string | null, master = false) {
     const r = this.list.get(id);
     if (!r) return;
     if (g) r.view.guild = g; else delete r.view.guild;
-    r.inst?.setGuildTag(g);
+    if (master) r.view.gmaster = 1; else delete r.view.gmaster;
+    r.inst?.setGuildTag(g, master);
   }
 
   /** membros da sua party: o nome deles fica verde */
@@ -289,6 +299,10 @@ export class NetClient {
   onMobDie: (id: number, killer: number) => void = () => {};
   onPlayerDie: (id: number) => void = () => {};
   onStats: (s: PlayerStats) => void = () => {};
+  /** outro jogador subiu de nível (efeito e movimento nele) */
+  onLevelUp: (id: number) => void = () => {};
+  /** como ficariam os atributos com os pontos ainda não aplicados (janela de personagem) */
+  onStatPreview: (s: PlayerStats) => void = () => {};
   /** suas skills (pontos, níveis, lista da classe) e skill lançada (espera) */
   onSkills: (points: number, levels: Record<string, number>, list: import('./skillwnd').SkillView[]) => void = () => {};
   onSkillUsed: (id: number, cd: number) => void = () => {};
@@ -303,10 +317,18 @@ export class NetClient {
   onTradeReq: (id: number, name: string) => void = () => {};
   onTrade: (v: TradeView) => void = () => {};
   onTradeClose: (text: string) => void = () => {};
-  /** sua Dark Illusion de GM ligou/desligou */
+  /** você ficou invisível / visível (modo invisível de GM ou Dark Illusion) */
   onInvis: (on: boolean) => void = () => {};
   /** seu modo imortal de GM/admin (//god) */
   onGod: (on: boolean) => void = () => {};
+  /** pet coletor: do jogador `a` apareceu (m = MI_*) ou sumiu (m = 0); foi buscar um item em (x, z), chega em `ms` */
+  onPet: (a: number, m: number) => void = () => {};
+  onPetGo: (a: number, x: number, z: number, ms: number) => void = () => {};
+  /** filtro do pet (ao entrar e depois de gravar) com nome e ícone dos itens das listas; resultado da busca de itens */
+  onPetFilter: (f: import('../shared/petfilter').PetFilter, names: Record<number, [string, string]>) => void = () => {};
+  onPetFind: (list: [number, string, string][]) => void = () => {};
+  /** destinos da janela Teleporter (pedidos com teleports()) */
+  onTeleports: (list: import('./teleport').TeleportView[]) => void = () => {};
   /** relógio do servidor (dia e noite) e a hora fixada pelo GM (null = andando) */
   onClock: (now: number, fixed: number | null) => void = () => {};
   /** o servidor mandou trocar de mundo (ticket de Azria, teleporte para outro mapa) */
@@ -314,7 +336,7 @@ export class NetClient {
   /** guild: sua guild (null = sem guild), convite recebido, o nome da sua guild mudou */
   onGuildView: (g: import('./guild').GuildView | null) => void = () => {};
   onGuildReq: (id: number, name: string, guild: string) => void = () => {};
-  onMyGuildTag: (g: string | null) => void = () => {};
+  onMyGuildTag: (g: string | null, master: boolean) => void = () => {};
   /** party: sua party (null = sem party), convite recebido, lista de partys */
   onParty: (p: import('./party').PartyView | null) => void = () => {};
   onPartyReq: (id: number, name: string) => void = () => {};
@@ -380,14 +402,17 @@ export class NetClient {
       if (m.t === 'welcome') {
         this.myId = m.id as number;
         this.remotes.clear();
-        for (const p of m.players as PlayerView[]) this.remotes.add(p);
+        for (const p of m.players as PlayerView[]) { this.remotes.add(p); if (p.pet) this.onPet(p.id, p.pet); }
         this.online = this.remotes.count + 1;
         this.onStatus('');
         this.onWelcome((m.eq ?? []) as string[], Number(m.mt ?? 0));
       } else if (m.t === 'enter') {
-        this.remotes.add(m.player as PlayerView); this.online = this.remotes.count + 1;
+        const p = m.player as PlayerView;
+        this.remotes.add(p); this.online = this.remotes.count + 1;
+        this.onPet(p.id, p.pet ?? 0);
       } else if (m.t === 'leave') {
         this.remotes.remove(m.id as number); this.online = this.remotes.count + 1;
+        this.onPet(m.id as number, 0);
       } else if (m.t === 'states') {
         for (const [id, x, y, z, h, s] of m.list as [number, number, number, number, number, string][]) if (id !== this.myId) this.remotes.update(id, x, y, z, h, s);
       } else if (m.t === 'mobs') {
@@ -435,6 +460,16 @@ export class NetClient {
       } else if (m.t === 'pong') {
         const rtt = performance.now() - Number(m.c);
         if (rtt >= 0 && rtt < 60000) this.ping = this.ping === null ? rtt : this.ping * 0.7 + rtt * 0.3;
+      } else if (m.t === 'pet') {
+        this.onPet(Number(m.a), Number(m.m) || 0);
+      } else if (m.t === 'petGo') {
+        this.onPetGo(Number(m.a), Number(m.x), Number(m.z), Number(m.ms) || 0);
+      } else if (m.t === 'petFilter') {
+        this.onPetFilter(m.f as import('../shared/petfilter').PetFilter, (m.n ?? {}) as Record<number, [string, string]>);
+      } else if (m.t === 'teleports') {
+        this.onTeleports((m.list ?? []) as import('./teleport').TeleportView[]);
+      } else if (m.t === 'petFind') {
+        this.onPetFind((m.list ?? []) as [number, string, string][]);
       } else if (m.t === 'clock') {
         this.onClock(Number(m.now) || Date.now(), typeof m.fixed === 'number' ? m.fixed : null);
       } else if (m.t === 'changeWorld') {
@@ -445,7 +480,7 @@ export class NetClient {
         this.onGuildReq(Number(m.id), String(m.name ?? ''), String(m.guild ?? ''));
       } else if (m.t === 'guildTag') {
         const g = m.g == null ? null : String(m.g);
-        if (Number(m.id) === this.myId) this.onMyGuildTag(g); else this.remotes.guildTag(Number(m.id), g);
+        if (Number(m.id) === this.myId) this.onMyGuildTag(g, !!m.m); else this.remotes.guildTag(Number(m.id), g, !!m.m);
       } else if (m.t === 'party') {
         this.onParty((m.p ?? null) as import('./party').PartyView | null);
       } else if (m.t === 'partyReq') {
@@ -482,8 +517,11 @@ export class NetClient {
         this.onGround((m.a ?? []) as GroundRow[], (m.d ?? []) as number[]);
       } else if (m.t === 'stats') {
         this.onStats(m as unknown as PlayerStats);
+      } else if (m.t === 'statPreview') {
+        this.onStatPreview(m as unknown as PlayerStats);
       } else if (m.t === 'level') {
         if (m.id === this.myId) this.onLevel(Number(m.level));
+        else if (this.remotes.setLevel(Number(m.id), Number(m.level))) this.onLevelUp(Number(m.id));
       } else if (m.t === 'look') {
         if (m.id === this.myId) this.onLook((m.eq ?? []) as string[], Number(m.mt ?? 0));
         else this.remotes.look(m.id as number, (m.eq ?? []) as string[], Number(m.mt ?? 0));
@@ -575,10 +613,17 @@ export class NetClient {
   /** distribui pontos de atributo */
   jobChange(job: number) { return this.raw({ t: 'jobChange', job }); }
   statUp(add: { str: number; sta: number; dex: number; int: number }) { return this.raw({ t: 'statUp', ...add }); }
+  /** pede a prévia dos atributos com esses pontos (nada é gravado) */
+  statPreview(add: { str: number; sta: number; dex: number; int: number }) { return this.raw({ t: 'statPreview', ...add }); }
   /** pega o item `id` do chão */
   pick(id: number) { return this.raw({ t: 'pick', id }); }
   /** golpe no mob `id` (o servidor confere alcance e ritmo) */
   attack(id: number) { return this.raw({ t: 'atk', id }); }
+  /** grava o filtro do pet; busca itens (nome/símbolo) para as listas do filtro */
+  petFilter(f: import('../shared/petfilter').PetFilter) { return this.raw({ t: 'petFilter', f }); }
+  petFind(q: string) { return this.raw({ t: 'petFind', q }); }
+  /** pede a lista de destinos do teleporte */
+  teleports() { return this.raw({ t: 'teleports' }); }
   /** painel de GM: busca no catálogo de itens (nome/símbolo, categoria) */
   gmItems(q: string, k: string, g = 0) { return this.raw({ t: 'gmItems', q, k, g }); }
   /** a cada 2 s manda o carimbo do relógio; o pong volta com ele e dá o ping */

@@ -954,3 +954,89 @@ Comparado com o MikePanqueca (Blade 73) do servidor oficial local (banco CHARACT
   em tela estreita (< 1400 px) o rodapé sobe para cima da barra de atalhos.
 - Ritmo do dia e noite: o ciclo continua 28,8 min reais, mas o dia (6h–19h) ocupa 3/4 dele (21,6 min, ~1 min 40 s por hora do
   jogo) e a noite (19h–6h) 1/4 (7,2 min, ~39 s por hora) — shared/gameclock.ts (DAWN, DUSK, DAY_SHARE).
+
+## 51. Painel admin → Items (2026-10-28)
+- Aba **Items**: todos os itens (15,5 mil) com ícone (DDS → PNG no painel, servers/common/icons.ts), ID (clicar copia, para o
+  `/ci` do servidor local), nome, símbolo, descrição, tipo e espaço; busca por nome/ID/símbolo e filtros (tipo, espaço,
+  raridade, só alterados, só removidos), paginação.
+- **Editar** (nome, descrição, ícone, visual de outro item, IK1/2/3, espaço PARTS, peça escondida, sexo, classe, nível,
+  ataque/defesa, velocidade, tipo de arma, mãos, raridade, elemento, empilhar, preço, loja e até 6 bônus DST); os campos
+  diferentes do Spec_Item ficam em amarelo. **Novo item** (símbolo II_*, opcional copiar de outro — vem com o visual dele),
+  **Remover do jogo** (desfazível) e **Voltar ao original**.
+- As mudanças ficam em `data/items-custom.json` (por cima do Spec_Item, que não é mexido; servers/common/items-custom.ts) e
+  valem no jogo ao reiniciar o servidor ("Aplicar no jogo"). Item novo usa o modelo de outro item (`look`) até ter modelo próprio.
+- Rudolph antigo (`II_ARM_*_CLO_RUDOLF01*`, IDs 4414–4421): no Spec_Item vai nos espaços de armadura (capacete/traje/luva/bota)
+  — a própria descrição oficial diz "Must be worn in the equipment slot"; os outros Rudolph vão nos de fashion (26–29).
+
+## 52. Pet coletor e Pet Filter (tecla U) (2026-10-28)
+- Itens IK3_PET (II_PET_LAWOLF1, AIBATT1, LEYENA1…): duplo clique chama o pet (dwLinkKind = MI_* que aparece) e de novo
+  recolhe; outro pet troca. Não gasta o item. Todos perto veem o pet (`pet` no PlayerView, mensagem 'pet').
+- Servidor (realtime.ts, como o CAIPet/__SYS_PETFILTER do Titanium): a cada 0,3 s o pet livre procura o item mais perto do dono
+  (até 20 unidades) que o dono pode pegar (dono do drop ou sem dono) e que passa no filtro; corre ~8 u/s ('petGo') e põe na
+  bolsa (giveLoot). Bolsa cheia: o item fica e o pet não insiste. Não busca morto, voando ou trocando de mapa.
+- Filtro (shared/petfilter.ts, bits do defineFilter.h + CUser::ShouldPickUp): marcar = NÃO pega — arma azul/verde/ultimate/
+  outras classes, armadura masculina/feminina/set azul/verde/outras classes, craft, ovo, sunstone, moonstone, quest, joias,
+  comida HP/MP/FP, colar/brinco/anel, cartas elemento/4%/7%/B/A; raridade mínima de arma e armadura (os drops ainda são todos
+  Common, então "a partir de Precious" ou mais deixa de pegar armas/armaduras). Lista branca pega sempre; negra, nunca.
+  Gravado em `characters.pet_filter` (migração 021).
+- Janela (client/petfilter.ts): abas Filtros (Todos/Nenhum/Salvar) e Listas (busca de item no lugar da janela Wiki do original;
+  Adicionar/Remover em cada lista, salva na hora). Cliente: client/pets.ts (pet = mob externo sem nome e sem clique).
+- GM: `//drop <II_…|id> [qtd]` larga itens sem dono no chão em volta (para testar o pet).
+- Falta: o pet não volta sozinho ao relogar (chamar de novo); raridade nos drops.
+- Altura: mobs que andam e o pet pisam também no chão dos objetos (calçadas, escadas, pontes), como o jogador —
+  MoverManager.floorAt = terreno ou colisão do objeto até um degrau (0,7) acima de onde estão; antes afundavam nas calçadas.
+
+## 53. Nomes: NPC, seleção e guild (2026-10-28)
+- NPCs e os mobs de cidade que não são monstros (guardas MI_MAFL_PATROL, cidadãos) têm o nome em COLOR_NPC (0xFFA0A0FF,
+  `.npc-label.npc`). Selecionar não muda mais a cor de nenhum nome; só aparecem as 4 setas.
+- Nome da guild 2 px maior (16 px); o mestre da guild (cargo 0) tem o nome da guild dourado (`gmaster` no PlayerView, `m` no
+  'guildTag', `.guild-tag.master`).
+- Falta: título do NPC acima do nome ("[Colosseum Shop]", "[Weapon]" — m_nStructure do character.inc).
+
+## 54. Objetos animados (2026-10-28)
+- Objetos do mapa que se mexem tocam a animação do próprio .o3d (shared/objanim.ts), como o CModelObject do original:
+  TM por objeto (`m_pFrame` de cada GMOBJECT, CObject3D::Animate — sino das torres de Flaris, placas, engrenagens, luzes) e
+  esqueleto embutido com movimento (m_pBaseBone + CMotion — ventiladores, guindastes, bandeiras, arbustos). O quadro anda
+  m_fPerSlerp por tique (62,5/s) e repete; todas as cópias de um modelo usam a mesma pose (calculada uma vez por quadro).
+- O leitor do .o3d agora guarda perSlerp, os quadros por peça, todos os nós (inclusive os sem malha) e os ossos embutidos.
+- As instâncias paradas desses modelos ficam invisíveis, só para o clique; as cópias animadas é que aparecem.
+- Correção: a geometria parada (models.ts) agora transforma uma cópia dos vértices — antes mudava o array do .o3d em cache.
+
+## 55. NPCs: movimentos sorteados, atender e cabelo da Peach (2026-10-28)
+- NPCs tocam de vez em quando (6–16 s) um MTI_IDLE1/IDLE2 com arquivo próprio e voltam ao MTI_STAND (ActionMoverState.cpp
+  faz isso ao fim do stand). Os Bobo (Boboku, Boboko, BoBoChan — MI_MAFL_BOBOKU) martelam no stand e se esticam no idle1.
+- Com o menu do NPC, a loja ou o ferreiro aberto, o NPC "atende": humano fica no MTI_STAND; quem trabalha no stand (Bobo)
+  fica no idle1 repetindo. Ao fechar, volta ao normal (MoverManager.attending, client/main.ts npcFrame).
+- Peach: o chapéu dela (Part_fCloMartaHair, dwBasePartsIgnore = cabelo) era tratado como cabelo e sumia junto. Agora o
+  dwBasePartsIgnore esconde só a cabeça/cabelo de base, antes de entrar o equipamento (shared/humans.ts).
+
+## 56. Invisible Mode (GM) e Dark Illusion (Acrobat) (2026-10-28)
+- Painel de GM: "Dark Illusion" virou "Invisible Mode" (//invis). As mensagens também.
+- Skill Dark Illusion (SI_ACR_SUP_DARKILLUSION, id 193): some pelo tempo da skill (4–14 s conforme o nível, CMover::SetDarkCover)
+  com o mesmo efeito do modo de GM — jogadores comuns não veem, GMs e o próprio veem translúcido, os mobs largam o alvo. Acaba
+  ao golpear, ao lançar outra skill, ao vencer ou ao tirar o buff (Ctrl.cpp / MoverActEvent.cpp). Ícone na barra de buffs.
+  Invisível = modo de GM ligado OU Dark Illusion ativa (Conn.gmInvis / Conn.dark, refreshInvis).
+- Translúcido agora vale para todas as malhas (roupa com vários materiais, arma, montaria), com 55% de opacidade (como o
+  cliente oficial mostra: escuro e ainda bem visível) e sem o nome em cima — antes a roupa continuava opaca. Ao lançar a
+  Dark Illusion aparece "Você usou Dark Illusion." em vermelho na cintura.
+- Falta: dano extra das skills que exigem Dark Illusion (Backstab, Vital Stab, Silent Shot) e o pet sumir junto para quem vê.
+
+## 57. Prévia dos atributos e teleporte do Titanium (2026-10-28)
+- Janela de personagem: ao pôr pontos (caixa ou +/−) o servidor calcula como ficaria ('statPreview', um Fighter de mentira,
+  nada gravado) e a janela mostra os valores novos, piscando em vermelho o que muda (Detalhe, HP/MP/FP máx. e o atributo).
+  Ex.: Mercenary com +28 DEX → Crítico 12%→15%, Vel. atq. 46%→51%.
+- Teleporte (tecla V) agora usa o AegonTeleporter.inc do Titanium (35 destinos, sem os 6 da Heaven Tower): três colunas
+  Destinos | imagem (Theme/Default/Teleporter/*.png) + descrição com o nível aconselhado (textClient: TID→IDS→texto, separado
+  por tab ou espaços) | Drops possíveis (ícone, nome e a dica do item). Sem o arquivo, volta ao ZckTeleporteur.inc.
+  A lista vem do servidor ('teleports'); o índice é o mesmo do 'zckTeleport'.
+
+## 58. Level Up (2026-10-28)
+- Ao subir de nível: a faixa "Level Up!" no alto da tela (g_Caption1 com __AEGON_ADVANCED_ANNOUNCEMENT, imagem 6 =
+  Theme/Default/Announcement/levelup.png, client/caption.ts), o pilar de luz XI_GEN_LEVEL_UP01 (SFX 42) e o movimento
+  MTI_LEVELUP se estiver parado, como o CMover::SetLevel do cliente oficial; aviso no chat. Outros jogadores perto veem o
+  pilar e o movimento ('level' com nível maior que o anterior). Descer de nível (GM) não mostra nada.
+- Falta: a música BGM_IN_LEVELUP.
+
+## 59. GM: teleporte pelo mini mapa (2026-10-28)
+- GM/admin: duplo clique no mini mapa (tecla N) teleporta na hora para o ponto clicado (manda //tp x z; o servidor confere a
+  autoridade). Jogador comum: o duplo clique não faz nada.
